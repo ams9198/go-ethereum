@@ -19,7 +19,6 @@ package types
 import (
 	"bytes"
 	"errors"
-	"fmt"
 	"io"
 	"math/big"
 	"sync/atomic"
@@ -38,13 +37,18 @@ var (
 	ErrTxTypeNotSupported   = errors.New("transaction type not supported")
 	ErrGasFeeCapTooLow      = errors.New("fee cap less than base fee")
 	errShortTypedTx         = errors.New("typed transaction too short")
-	errInvalidYParity       = errors.New("'yParity' field must be 0 or 1")
-	errVYParityMismatch     = errors.New("'v' and 'yParity' fields do not match")
-	errVYParityMissing      = errors.New("missing 'yParity' or 'v' field in transaction")
 )
 
 // Transaction types.
 const (
+	ArbitrumDepositTxType         = 0x64
+	ArbitrumUnsignedTxType        = 0x65
+	ArbitrumContractTxType        = 0x66
+	ArbitrumRetryTxType           = 0x68
+	ArbitrumSubmitRetryableTxType = 0x69
+	ArbitrumInternalTxType        = 0x6A
+	ArbitrumLegacyTxType          = 0x78
+
 	LegacyTxType     = 0x00
 	AccessListTxType = 0x01
 	DynamicFeeTxType = 0x02
@@ -56,10 +60,13 @@ type Transaction struct {
 	inner TxData    // Consensus contents of a transaction
 	time  time.Time // Time first seen locally (spam avoidance)
 
+	// Arbitrum cache: must be atomically accessed
+	CalldataUnits uint64
+
 	// caches
-	hash atomic.Pointer[common.Hash]
-	size atomic.Uint64
-	from atomic.Pointer[sigCache]
+	hash atomic.Value
+	size atomic.Value
+	from atomic.Value
 }
 
 // NewTx creates a new transaction.
@@ -89,6 +96,8 @@ type TxData interface {
 
 	rawSignatureValues() (v, r, s *big.Int)
 	setSignatureValues(chainID, v, r, s *big.Int)
+
+	skipAccountChecks() bool
 
 	// effectiveGasPrice computes the gas price paid by the transaction, given
 	// the inclusion block baseFee.
@@ -163,7 +172,7 @@ func (tx *Transaction) DecodeRLP(s *rlp.Stream) error {
 			return err
 		}
 		// Now decode the inner transaction.
-		inner, err := tx.decodeTyped(b)
+		inner, err := tx.decodeTyped(b, true)
 		if err == nil {
 			tx.setDecoded(inner, size)
 		}
@@ -185,7 +194,7 @@ func (tx *Transaction) UnmarshalBinary(b []byte) error {
 		return nil
 	}
 	// It's an EIP-2718 typed transaction envelope.
-	inner, err := tx.decodeTyped(b)
+	inner, err := tx.decodeTyped(b, false)
 	if err != nil {
 		return err
 	}
@@ -194,20 +203,42 @@ func (tx *Transaction) UnmarshalBinary(b []byte) error {
 }
 
 // decodeTyped decodes a typed transaction from the canonical format.
-func (tx *Transaction) decodeTyped(b []byte) (TxData, error) {
+func (tx *Transaction) decodeTyped(b []byte, arbParsing bool) (TxData, error) {
 	if len(b) <= 1 {
 		return nil, errShortTypedTx
 	}
 	var inner TxData
-	switch b[0] {
-	case AccessListTxType:
-		inner = new(AccessListTx)
-	case DynamicFeeTxType:
-		inner = new(DynamicFeeTx)
-	case BlobTxType:
-		inner = new(BlobTx)
-	default:
-		return nil, ErrTxTypeNotSupported
+	if arbParsing {
+		switch b[0] {
+		case ArbitrumDepositTxType:
+			inner = new(ArbitrumDepositTx)
+		case ArbitrumInternalTxType:
+			inner = new(ArbitrumInternalTx)
+		case ArbitrumUnsignedTxType:
+			inner = new(ArbitrumUnsignedTx)
+		case ArbitrumContractTxType:
+			inner = new(ArbitrumContractTx)
+		case ArbitrumRetryTxType:
+			inner = new(ArbitrumRetryTx)
+		case ArbitrumSubmitRetryableTxType:
+			inner = new(ArbitrumSubmitRetryableTx)
+		case ArbitrumLegacyTxType:
+			inner = new(ArbitrumLegacyTxData)
+		default:
+			arbParsing = false
+		}
+	}
+	if !arbParsing {
+		switch b[0] {
+		case AccessListTxType:
+			inner = new(AccessListTx)
+		case DynamicFeeTxType:
+			inner = new(DynamicFeeTx)
+		case BlobTxType:
+			inner = new(BlobTx)
+		default:
+			return nil, ErrTxTypeNotSupported
+		}
 	}
 	err := inner.decode(b[1:])
 	return inner, err
@@ -272,6 +303,10 @@ func (tx *Transaction) Type() uint8 {
 	return tx.inner.txType()
 }
 
+func (tx *Transaction) GetInner() TxData {
+	return tx.inner.copy()
+}
+
 // ChainId returns the EIP155 chain ID of the transaction. The return value will always be
 // non-nil. For legacy transactions which are not replay-protected, the return value is
 // zero.
@@ -321,7 +356,6 @@ func (tx *Transaction) Cost() *big.Int {
 
 // RawSignatureValues returns the V, R, S signature values of the transaction.
 // The return values should not be modified by the caller.
-// The return values may be nil or zero, if the transaction is unsigned.
 func (tx *Transaction) RawSignatureValues() (v, r, s *big.Int) {
 	return tx.inner.rawSignatureValues()
 }
@@ -446,26 +480,6 @@ func (tx *Transaction) WithoutBlobTxSidecar() *Transaction {
 	return cpy
 }
 
-// WithBlobTxSidecar returns a copy of tx with the blob sidecar added.
-func (tx *Transaction) WithBlobTxSidecar(sideCar *BlobTxSidecar) *Transaction {
-	blobtx, ok := tx.inner.(*BlobTx)
-	if !ok {
-		return tx
-	}
-	cpy := &Transaction{
-		inner: blobtx.withSidecar(sideCar),
-		time:  tx.time,
-	}
-	// Note: tx.size cache not carried over because the sidecar is included in size!
-	if h := tx.hash.Load(); h != nil {
-		cpy.hash.Store(h)
-	}
-	if f := tx.from.Load(); f != nil {
-		cpy.from.Store(f)
-	}
-	return cpy
-}
-
 // SetTime sets the decoding time of a transaction. This is used by tests to set
 // arbitrary times and by persistent transaction pools when loading old txs from
 // disk.
@@ -482,24 +496,26 @@ func (tx *Transaction) Time() time.Time {
 // Hash returns the transaction hash.
 func (tx *Transaction) Hash() common.Hash {
 	if hash := tx.hash.Load(); hash != nil {
-		return *hash
+		return hash.(common.Hash)
 	}
 
 	var h common.Hash
 	if tx.Type() == LegacyTxType {
 		h = rlpHash(tx.inner)
+	} else if tx.Type() == ArbitrumLegacyTxType {
+		h = tx.inner.(*ArbitrumLegacyTxData).HashOverride
 	} else {
 		h = prefixedRlpHash(tx.Type(), tx.inner)
 	}
-	tx.hash.Store(&h)
+	tx.hash.Store(h)
 	return h
 }
 
 // Size returns the true encoded storage size of the transaction, either by encoding
 // and returning it, or returning a previously cached value.
 func (tx *Transaction) Size() uint64 {
-	if size := tx.size.Load(); size > 0 {
-		return size
+	if size := tx.size.Load(); size != nil {
+		return size.(uint64)
 	}
 
 	// Cache miss, encode and cache.
@@ -530,9 +546,6 @@ func (tx *Transaction) WithSignature(signer Signer, sig []byte) (*Transaction, e
 	if err != nil {
 		return nil, err
 	}
-	if r == nil || s == nil || v == nil {
-		return nil, fmt.Errorf("%w: r: %s, s: %s, v: %s", ErrInvalidSig, r, s, v)
-	}
 	cpy := tx.inner.copy()
 	cpy.setSignatureValues(signer.ChainID(), v, r, s)
 	return &Transaction{inner: cpy, time: tx.time}, nil
@@ -551,6 +564,9 @@ func (s Transactions) EncodeIndex(i int, w *bytes.Buffer) {
 	tx := s[i]
 	if tx.Type() == LegacyTxType {
 		rlp.Encode(w, tx.inner)
+	} else if tx.Type() == ArbitrumLegacyTxType {
+		arbData := tx.inner.(*ArbitrumLegacyTxData)
+		arbData.EncodeOnlyLegacyInto(w)
 	} else {
 		tx.encodeTyped(w)
 	}

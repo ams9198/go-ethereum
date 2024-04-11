@@ -18,10 +18,8 @@ package downloader
 
 import (
 	"fmt"
-	"log/slog"
 	"math/big"
 	"math/rand"
-	"os"
 	"sync"
 	"testing"
 	"time"
@@ -273,7 +271,7 @@ func XTestDelivery(t *testing.T) {
 	world.chain = blo
 	world.progress(10)
 	if false {
-		log.SetDefault(log.NewLogger(slog.NewTextHandler(os.Stdout, nil)))
+		log.Root().SetHandler(log.StdoutHandler)
 	}
 	q := newQueue(10, 10)
 	var wg sync.WaitGroup

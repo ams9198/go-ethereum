@@ -22,7 +22,6 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
-	"slices"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/consensus/misc/eip4844"
@@ -32,6 +31,7 @@ import (
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/params"
 	"github.com/ethereum/go-ethereum/rlp"
+	"golang.org/x/exp/slices"
 )
 
 // ReadCanonicalHash retrieves the hash assigned to a canonical block number.
@@ -278,6 +278,23 @@ func WriteTxIndexTail(db ethdb.KeyValueWriter, number uint64) {
 	}
 }
 
+// ReadFastTxLookupLimit retrieves the tx lookup limit used in fast sync.
+func ReadFastTxLookupLimit(db ethdb.KeyValueReader) *uint64 {
+	data, _ := db.Get(fastTxLookupLimitKey)
+	if len(data) != 8 {
+		return nil
+	}
+	number := binary.BigEndian.Uint64(data)
+	return &number
+}
+
+// WriteFastTxLookupLimit stores the txlookup limit used in fast sync into database.
+func WriteFastTxLookupLimit(db ethdb.KeyValueWriter, number uint64) {
+	if err := db.Put(fastTxLookupLimitKey, encodeBlockNumber(number)); err != nil {
+		log.Crit("Failed to store transaction lookup limit for fast sync", "err", err)
+	}
+}
+
 // ReadHeaderRange returns the rlp-encoded headers, starting at 'number', and going
 // backwards towards genesis. This method assumes that the caller already has
 // placed a cap on count, to prevent DoS issues.
@@ -317,18 +334,13 @@ func ReadHeaderRange(db ethdb.Reader, number uint64, count uint64) []rlp.RawValu
 		return rlpHeaders
 	}
 	// read remaining from ancients
-	data, err := db.AncientRange(ChainFreezerHeaderTable, i+1-count, count, 0)
-	if err != nil {
-		log.Error("Failed to read headers from freezer", "err", err)
-		return rlpHeaders
-	}
-	if uint64(len(data)) != count {
-		log.Warn("Incomplete read of headers from freezer", "wanted", count, "read", len(data))
-		return rlpHeaders
-	}
-	// The data is on the order [h, h+1, .., n] -- reordering needed
-	for i := range data {
-		rlpHeaders = append(rlpHeaders, data[len(data)-1-i])
+	max := count * 700
+	data, err := db.AncientRange(ChainFreezerHeaderTable, i+1-count, count, max)
+	if err == nil && uint64(len(data)) == count {
+		// the data is on the order [h, h+1, .., n] -- reordering needed
+		for i := range data {
+			rlpHeaders = append(rlpHeaders, data[len(data)-1-i])
+		}
 	}
 	return rlpHeaders
 }
@@ -675,7 +687,9 @@ func DeleteReceipts(db ethdb.KeyValueWriter, hash common.Hash, number uint64) {
 type storedReceiptRLP struct {
 	PostStateOrStatus []byte
 	CumulativeGasUsed uint64
+	L1GasUsed         uint64 // Arbitrum specific
 	Logs              []*types.Log
+	ContractAddress   *common.Address `rlp:"optional"` // set on new versions if an Arbitrum tx type
 }
 
 // ReceiptLogs is a barebone version of ReceiptForStorage which only keeps
@@ -695,7 +709,7 @@ func (r *receiptLogs) DecodeRLP(s *rlp.Stream) error {
 	return nil
 }
 
-// deriveLogFields fills the logs in receiptLogs with information such as block number, txhash, etc.
+// DeriveLogFields fills the logs in receiptLogs with information such as block number, txhash, etc.
 func deriveLogFields(receipts []*receiptLogs, hash common.Hash, number uint64, txs types.Transactions) error {
 	logIndex := uint(0)
 	if len(txs) != len(receipts) {
@@ -727,6 +741,10 @@ func ReadLogs(db ethdb.Reader, hash common.Hash, number uint64) [][]*types.Log {
 	}
 	receipts := []*receiptLogs{}
 	if err := rlp.DecodeBytes(data, &receipts); err != nil {
+		if logs := readLegacyLogs(db, hash, number); logs != nil {
+			return logs
+		}
+
 		log.Error("Invalid receipt array RLP", "hash", hash, "err", err)
 		return nil
 	}
@@ -734,6 +752,33 @@ func ReadLogs(db ethdb.Reader, hash common.Hash, number uint64) [][]*types.Log {
 	logs := make([][]*types.Log, len(receipts))
 	for i, receipt := range receipts {
 		logs[i] = receipt.Logs
+	}
+	return logs
+}
+
+// readLegacyLogs is a temporary workaround for when trying to read logs
+// from a block which has its receipt stored in the legacy format. It'll
+// be removed after users have migrated their freezer databases.
+// Arbitrum: we are keeping this to handle classic (legacy) receipts
+func readLegacyLogs(db ethdb.Reader, hash common.Hash, number uint64) [][]*types.Log {
+	// The time can be zero since Arbitrum legacy receipts on Arbitrum One are pre-Cancun,
+	// and the time only affects which fork's signer is picked.
+	receipts := ReadRawReceipts(db, hash, number)
+	if receipts == nil {
+		return nil
+	}
+	logs := make([][]*types.Log, len(receipts))
+	logIndex := uint(0)
+	for i, receipt := range receipts {
+		logs[i] = receipt.Logs
+		for j := range logs[i] {
+			logs[i][j].BlockNumber = number
+			logs[i][j].BlockHash = hash
+			logs[i][j].TxHash = receipt.TxHash
+			logs[i][j].TxIndex = uint(i)
+			logs[i][j].Index = logIndex
+			logIndex++
+		}
 	}
 	return logs
 }

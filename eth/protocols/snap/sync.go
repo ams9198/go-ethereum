@@ -295,18 +295,10 @@ type bytecodeHealResponse struct {
 
 // accountTask represents the sync task for a chunk of the account snapshot.
 type accountTask struct {
-	// These fields get serialized to key-value store on shutdown
+	// These fields get serialized to leveldb on shutdown
 	Next     common.Hash                    // Next account to sync in this interval
 	Last     common.Hash                    // Last account to sync in this interval
 	SubTasks map[common.Hash][]*storageTask // Storage intervals needing fetching for large contracts
-
-	// This is a list of account hashes whose storage are already completed
-	// in this cycle. This field is newly introduced in v1.14 and will be
-	// empty if the task is resolved from legacy progress data. Furthermore,
-	// this additional field will be ignored by legacy Geth. The only side
-	// effect is that these contracts might be resynced in the new cycle,
-	// retaining the legacy behavior.
-	StorageCompleted []common.Hash `json:",omitempty"`
 
 	// These fields are internals used during runtime
 	req  *accountRequest  // Pending request to fill this task
@@ -317,38 +309,13 @@ type accountTask struct {
 	needState []bool // Flags whether the filling accounts need storage retrieval
 	needHeal  []bool // Flags whether the filling accounts's state was chunked and need healing
 
-	codeTasks      map[common.Hash]struct{}    // Code hashes that need retrieval
-	stateTasks     map[common.Hash]common.Hash // Account hashes->roots that need full state retrieval
-	stateCompleted map[common.Hash]struct{}    // Account hashes whose storage have been completed
+	codeTasks  map[common.Hash]struct{}    // Code hashes that need retrieval
+	stateTasks map[common.Hash]common.Hash // Account hashes->roots that need full state retrieval
 
 	genBatch ethdb.Batch     // Batch used by the node generator
 	genTrie  *trie.StackTrie // Node generator from storage slots
 
 	done bool // Flag whether the task can be removed
-}
-
-// activeSubTasks returns the set of storage tasks covered by the current account
-// range. Normally this would be the entire subTask set, but on a sync interrupt
-// and later resume it can happen that a shorter account range is retrieved. This
-// method ensures that we only start up the subtasks covered by the latest account
-// response.
-//
-// Nil is returned if the account range is empty.
-func (task *accountTask) activeSubTasks() map[common.Hash][]*storageTask {
-	if len(task.res.hashes) == 0 {
-		return nil
-	}
-	var (
-		tasks = make(map[common.Hash][]*storageTask)
-		last  = task.res.hashes[len(task.res.hashes)-1]
-	)
-	for hash, subTasks := range task.SubTasks {
-		subTasks := subTasks // closure
-		if hash.Cmp(last) <= 0 {
-			tasks[hash] = subTasks
-		}
-	}
-	return tasks
 }
 
 // storageTask represents the sync task for a chunk of the storage snapshot.
@@ -749,19 +716,6 @@ func (s *Syncer) Sync(root common.Hash, cancel chan struct{}) error {
 	}
 }
 
-// cleanPath is used to remove the dangling nodes in the stackTrie.
-func (s *Syncer) cleanPath(batch ethdb.Batch, owner common.Hash, path []byte) {
-	if owner == (common.Hash{}) && rawdb.ExistsAccountTrieNode(s.db, path) {
-		rawdb.DeleteAccountTrieNode(batch, path)
-		deletionGauge.Inc(1)
-	}
-	if owner != (common.Hash{}) && rawdb.ExistsStorageTrieNode(s.db, owner, path) {
-		rawdb.DeleteStorageTrieNode(batch, owner, path)
-		deletionGauge.Inc(1)
-	}
-	lookupGauge.Inc(1)
-}
-
 // loadSyncStatus retrieves a previously aborted sync status from the database,
 // or generates a fresh one if none is available.
 func (s *Syncer) loadSyncStatus() {
@@ -778,38 +732,15 @@ func (s *Syncer) loadSyncStatus() {
 			for _, task := range s.tasks {
 				task := task // closure for task.genBatch in the stacktrie writer callback
 
-				// Restore the completed storages
-				task.stateCompleted = make(map[common.Hash]struct{})
-				for _, hash := range task.StorageCompleted {
-					task.stateCompleted[hash] = struct{}{}
-				}
-				task.StorageCompleted = nil
-
-				// Allocate batch for account trie generation
 				task.genBatch = ethdb.HookedBatch{
 					Batch: s.db.NewBatch(),
 					OnPut: func(key []byte, value []byte) {
 						s.accountBytes += common.StorageSize(len(key) + len(value))
 					},
 				}
-				options := trie.NewStackTrieOptions()
-				options = options.WithWriter(func(path []byte, hash common.Hash, blob []byte) {
-					rawdb.WriteTrieNode(task.genBatch, common.Hash{}, path, hash, blob, s.scheme)
+				task.genTrie = trie.NewStackTrie(func(path []byte, hash common.Hash, val []byte) {
+					rawdb.WriteTrieNode(task.genBatch, common.Hash{}, path, hash, val, s.scheme)
 				})
-				if s.scheme == rawdb.PathScheme {
-					// Configure the dangling node cleaner and also filter out boundary nodes
-					// only in the context of the path scheme. Deletion is forbidden in the
-					// hash scheme, as it can disrupt state completeness.
-					options = options.WithCleaner(func(path []byte) {
-						s.cleanPath(task.genBatch, common.Hash{}, path)
-					})
-					// Skip the left boundary if it's not the first range.
-					// Skip the right boundary if it's not the last range.
-					options = options.WithSkipBoundary(task.Next != (common.Hash{}), task.Last != common.MaxHash, boundaryAccountNodesGauge)
-				}
-				task.genTrie = trie.NewStackTrie(options)
-
-				// Restore leftover storage tasks
 				for accountHash, subtasks := range task.SubTasks {
 					for _, subtask := range subtasks {
 						subtask := subtask // closure for subtask.genBatch in the stacktrie writer callback
@@ -821,22 +752,9 @@ func (s *Syncer) loadSyncStatus() {
 							},
 						}
 						owner := accountHash // local assignment for stacktrie writer closure
-						options := trie.NewStackTrieOptions()
-						options = options.WithWriter(func(path []byte, hash common.Hash, blob []byte) {
-							rawdb.WriteTrieNode(subtask.genBatch, owner, path, hash, blob, s.scheme)
+						subtask.genTrie = trie.NewStackTrie(func(path []byte, hash common.Hash, val []byte) {
+							rawdb.WriteTrieNode(subtask.genBatch, owner, path, hash, val, s.scheme)
 						})
-						if s.scheme == rawdb.PathScheme {
-							// Configure the dangling node cleaner and also filter out boundary nodes
-							// only in the context of the path scheme. Deletion is forbidden in the
-							// hash scheme, as it can disrupt state completeness.
-							options = options.WithCleaner(func(path []byte) {
-								s.cleanPath(subtask.genBatch, owner, path)
-							})
-							// Skip the left boundary if it's not the first range.
-							// Skip the right boundary if it's not the last range.
-							options = options.WithSkipBoundary(subtask.Next != common.Hash{}, subtask.Last != common.MaxHash, boundaryStorageNodesGauge)
-						}
-						subtask.genTrie = trie.NewStackTrie(options)
 					}
 				}
 			}
@@ -880,7 +798,7 @@ func (s *Syncer) loadSyncStatus() {
 		last := common.BigToHash(new(big.Int).Add(next.Big(), step))
 		if i == accountConcurrency-1 {
 			// Make sure we don't overflow if the step is not a proper divisor
-			last = common.MaxHash
+			last = common.HexToHash("0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")
 		}
 		batch := ethdb.HookedBatch{
 			Batch: s.db.NewBatch(),
@@ -888,28 +806,14 @@ func (s *Syncer) loadSyncStatus() {
 				s.accountBytes += common.StorageSize(len(key) + len(value))
 			},
 		}
-		options := trie.NewStackTrieOptions()
-		options = options.WithWriter(func(path []byte, hash common.Hash, blob []byte) {
-			rawdb.WriteTrieNode(batch, common.Hash{}, path, hash, blob, s.scheme)
-		})
-		if s.scheme == rawdb.PathScheme {
-			// Configure the dangling node cleaner and also filter out boundary nodes
-			// only in the context of the path scheme. Deletion is forbidden in the
-			// hash scheme, as it can disrupt state completeness.
-			options = options.WithCleaner(func(path []byte) {
-				s.cleanPath(batch, common.Hash{}, path)
-			})
-			// Skip the left boundary if it's not the first range.
-			// Skip the right boundary if it's not the last range.
-			options = options.WithSkipBoundary(next != common.Hash{}, last != common.MaxHash, boundaryAccountNodesGauge)
-		}
 		s.tasks = append(s.tasks, &accountTask{
-			Next:           next,
-			Last:           last,
-			SubTasks:       make(map[common.Hash][]*storageTask),
-			genBatch:       batch,
-			stateCompleted: make(map[common.Hash]struct{}),
-			genTrie:        trie.NewStackTrie(options),
+			Next:     next,
+			Last:     last,
+			SubTasks: make(map[common.Hash][]*storageTask),
+			genBatch: batch,
+			genTrie: trie.NewStackTrie(func(path []byte, hash common.Hash, val []byte) {
+				rawdb.WriteTrieNode(batch, common.Hash{}, path, hash, val, s.scheme)
+			}),
 		})
 		log.Debug("Created account sync task", "from", next, "last", last)
 		next = common.BigToHash(new(big.Int).Add(last.Big(), common.Big1))
@@ -929,14 +833,6 @@ func (s *Syncer) saveSyncStatus() {
 					log.Error("Failed to persist storage slots", "err", err)
 				}
 			}
-		}
-		// Save the account hashes of completed storage.
-		task.StorageCompleted = make([]common.Hash, 0, len(task.stateCompleted))
-		for hash := range task.stateCompleted {
-			task.StorageCompleted = append(task.StorageCompleted, hash)
-		}
-		if len(task.StorageCompleted) > 0 {
-			log.Debug("Leftover completed storages", "number", len(task.StorageCompleted), "next", task.Next, "last", task.Last)
 		}
 	}
 	// Store the actual progress markers
@@ -1021,10 +917,6 @@ func (s *Syncer) cleanStorageTasks() {
 			}
 			delete(task.SubTasks, account)
 			task.pend--
-
-			// Mark the state as complete to prevent resyncing, regardless
-			// if state healing is necessary.
-			task.stateCompleted[account] = struct{}{}
 
 			// If this was the last pending task, forward the account task
 			if task.pend == 0 {
@@ -1265,8 +1157,7 @@ func (s *Syncer) assignStorageTasks(success chan *storageResponse, fail chan *st
 			continue
 		}
 		// Skip tasks that are already retrieving (or done with) all small states
-		storageTasks := task.activeSubTasks()
-		if len(storageTasks) == 0 && len(task.stateTasks) == 0 {
+		if len(task.SubTasks) == 0 && len(task.stateTasks) == 0 {
 			continue
 		}
 		// Task pending retrieval, try to find an idle peer. If no such peer
@@ -1310,7 +1201,7 @@ func (s *Syncer) assignStorageTasks(success chan *storageResponse, fail chan *st
 			roots    = make([]common.Hash, 0, storageSets)
 			subtask  *storageTask
 		)
-		for account, subtasks := range storageTasks {
+		for account, subtasks := range task.SubTasks {
 			for _, st := range subtasks {
 				// Skip any subtasks already filling
 				if st.req != nil {
@@ -1907,11 +1798,11 @@ func (s *Syncer) processAccountResponse(res *accountResponse) {
 	res.task.res = res
 
 	// Ensure that the response doesn't overflow into the subsequent task
-	lastBig := res.task.Last.Big()
+	last := res.task.Last.Big()
 	for i, hash := range res.hashes {
 		// Mark the range complete if the last is already included.
 		// Keep iteration to delete the extra states if exists.
-		cmp := hash.Big().Cmp(lastBig)
+		cmp := hash.Big().Cmp(last)
 		if cmp == 0 {
 			res.cont = false
 			continue
@@ -1947,21 +1838,7 @@ func (s *Syncer) processAccountResponse(res *accountResponse) {
 		}
 		// Check if the account is a contract with an unknown storage trie
 		if account.Root != types.EmptyRootHash {
-			// If the storage was already retrieved in the last cycle, there's no need
-			// to resync it again, regardless of whether the storage root is consistent
-			// or not.
-			if _, exist := res.task.stateCompleted[res.hashes[i]]; exist {
-				// The leftover storage tasks are not expected, unless system is
-				// very wrong.
-				if _, ok := res.task.SubTasks[res.hashes[i]]; ok {
-					panic(fmt.Errorf("unexpected leftover storage tasks, owner: %x", res.hashes[i]))
-				}
-				// Mark the healing tag if storage root node is inconsistent, or
-				// it's non-existent due to storage chunking.
-				if !rawdb.HasTrieNode(s.db, res.hashes[i], nil, account.Root, s.scheme) {
-					res.task.needHeal[i] = true
-				}
-			} else {
+			if !rawdb.HasTrieNode(s.db, res.hashes[i], nil, account.Root, s.scheme) {
 				// If there was a previous large state retrieval in progress,
 				// don't restart it from scratch. This happens if a sync cycle
 				// is interrupted and resumed later. However, *do* update the
@@ -1973,12 +1850,7 @@ func (s *Syncer) processAccountResponse(res *accountResponse) {
 					}
 					res.task.needHeal[i] = true
 					resumed[res.hashes[i]] = struct{}{}
-					largeStorageResumedGauge.Inc(1)
 				} else {
-					// It's possible that in the hash scheme, the storage, along
-					// with the trie nodes of the given root, is already present
-					// in the database. Schedule the storage task anyway to simplify
-					// the logic here.
 					res.task.stateTasks[res.hashes[i]] = account.Root
 				}
 				res.task.needState[i] = true
@@ -1986,29 +1858,13 @@ func (s *Syncer) processAccountResponse(res *accountResponse) {
 			}
 		}
 	}
-	// Delete any subtasks that have been aborted but not resumed. It's essential
-	// as the corresponding contract might be self-destructed in this cycle(it's
-	// no longer possible in ethereum as self-destruction is disabled in Cancun
-	// Fork, but the condition is still necessary for other networks).
-	//
-	// Keep the leftover storage tasks if they are not covered by the responded
-	// account range which should be picked up in next account wave.
-	if len(res.hashes) > 0 {
-		// The hash of last delivered account in the response
-		last := res.hashes[len(res.hashes)-1]
-		for hash := range res.task.SubTasks {
-			// TODO(rjl493456442) degrade the log level before merging.
-			if hash.Cmp(last) > 0 {
-				log.Info("Keeping suspended storage retrieval", "account", hash)
-				continue
-			}
-			// TODO(rjl493456442) degrade the log level before merging.
-			// It should never happen in ethereum.
-			if _, ok := resumed[hash]; !ok {
-				log.Error("Aborting suspended storage retrieval", "account", hash)
-				delete(res.task.SubTasks, hash)
-				largeStorageDiscardGauge.Inc(1)
-			}
+	// Delete any subtasks that have been aborted but not resumed. This may undo
+	// some progress if a new peer gives us less accounts than an old one, but for
+	// now we have to live with that.
+	for hash := range res.task.SubTasks {
+		if _, ok := resumed[hash]; !ok {
+			log.Debug("Aborting suspended storage retrieval", "account", hash)
+			delete(res.task.SubTasks, hash)
 		}
 	}
 	// If the account range contained no contracts, or all have been fully filled
@@ -2018,7 +1874,7 @@ func (s *Syncer) processAccountResponse(res *accountResponse) {
 		return
 	}
 	// Some accounts are incomplete, leave as is for the storage and contract
-	// task assigners to pick up and fill
+	// task assigners to pick up and fill.
 }
 
 // processBytecodeResponse integrates an already validated bytecode response
@@ -2106,8 +1962,6 @@ func (s *Syncer) processStorageResponse(res *storageResponse) {
 			if res.subTask == nil && res.mainTask.needState[j] && (i < len(res.hashes)-1 || !res.cont) {
 				res.mainTask.needState[j] = false
 				res.mainTask.pend--
-				res.mainTask.stateCompleted[account] = struct{}{} // mark it as completed
-				smallStorageGauge.Inc(1)
 			}
 			// If the last contract was chunked, mark it as needing healing
 			// to avoid writing it out to disk prematurely.
@@ -2143,11 +1997,7 @@ func (s *Syncer) processStorageResponse(res *storageResponse) {
 						log.Debug("Chunked large contract", "initiators", len(keys), "tail", lastKey, "chunks", chunks)
 					}
 					r := newHashRange(lastKey, chunks)
-					if chunks == 1 {
-						smallStorageGauge.Inc(1)
-					} else {
-						largeStorageGauge.Inc(1)
-					}
+
 					// Our first task is the one that was just filled by this response.
 					batch := ethdb.HookedBatch{
 						Batch: s.db.NewBatch(),
@@ -2156,24 +2006,14 @@ func (s *Syncer) processStorageResponse(res *storageResponse) {
 						},
 					}
 					owner := account // local assignment for stacktrie writer closure
-					options := trie.NewStackTrieOptions()
-					options = options.WithWriter(func(path []byte, hash common.Hash, blob []byte) {
-						rawdb.WriteTrieNode(batch, owner, path, hash, blob, s.scheme)
-					})
-					if s.scheme == rawdb.PathScheme {
-						options = options.WithCleaner(func(path []byte) {
-							s.cleanPath(batch, owner, path)
-						})
-						// Keep the left boundary as it's the first range.
-						// Skip the right boundary if it's not the last range.
-						options = options.WithSkipBoundary(false, r.End() != common.MaxHash, boundaryStorageNodesGauge)
-					}
 					tasks = append(tasks, &storageTask{
 						Next:     common.Hash{},
 						Last:     r.End(),
 						root:     acc.Root,
 						genBatch: batch,
-						genTrie:  trie.NewStackTrie(options),
+						genTrie: trie.NewStackTrie(func(path []byte, hash common.Hash, val []byte) {
+							rawdb.WriteTrieNode(batch, owner, path, hash, val, s.scheme)
+						}),
 					})
 					for r.Next() {
 						batch := ethdb.HookedBatch{
@@ -2182,27 +2022,14 @@ func (s *Syncer) processStorageResponse(res *storageResponse) {
 								s.storageBytes += common.StorageSize(len(key) + len(value))
 							},
 						}
-						options := trie.NewStackTrieOptions()
-						options = options.WithWriter(func(path []byte, hash common.Hash, blob []byte) {
-							rawdb.WriteTrieNode(batch, owner, path, hash, blob, s.scheme)
-						})
-						if s.scheme == rawdb.PathScheme {
-							// Configure the dangling node cleaner and also filter out boundary nodes
-							// only in the context of the path scheme. Deletion is forbidden in the
-							// hash scheme, as it can disrupt state completeness.
-							options = options.WithCleaner(func(path []byte) {
-								s.cleanPath(batch, owner, path)
-							})
-							// Skip the left boundary as it's not the first range
-							// Skip the right boundary if it's not the last range.
-							options = options.WithSkipBoundary(true, r.End() != common.MaxHash, boundaryStorageNodesGauge)
-						}
 						tasks = append(tasks, &storageTask{
 							Next:     r.Start(),
 							Last:     r.End(),
 							root:     acc.Root,
 							genBatch: batch,
-							genTrie:  trie.NewStackTrie(options),
+							genTrie: trie.NewStackTrie(func(path []byte, hash common.Hash, val []byte) {
+								rawdb.WriteTrieNode(batch, owner, path, hash, val, s.scheme)
+							}),
 						})
 					}
 					for _, task := range tasks {
@@ -2248,22 +2075,9 @@ func (s *Syncer) processStorageResponse(res *storageResponse) {
 
 		if i < len(res.hashes)-1 || res.subTask == nil {
 			// no need to make local reassignment of account: this closure does not outlive the loop
-			options := trie.NewStackTrieOptions()
-			options = options.WithWriter(func(path []byte, hash common.Hash, blob []byte) {
-				rawdb.WriteTrieNode(batch, account, path, hash, blob, s.scheme)
+			tr := trie.NewStackTrie(func(path []byte, hash common.Hash, val []byte) {
+				rawdb.WriteTrieNode(batch, account, path, hash, val, s.scheme)
 			})
-			if s.scheme == rawdb.PathScheme {
-				// Configure the dangling node cleaner only in the context of the
-				// path scheme. Deletion is forbidden in the hash scheme, as it can
-				// disrupt state completeness.
-				//
-				// Notably, boundary nodes can be also kept because the whole storage
-				// trie is complete.
-				options = options.WithCleaner(func(path []byte) {
-					s.cleanPath(batch, account, path)
-				})
-			}
-			tr := trie.NewStackTrie(options)
 			for j := 0; j < len(res.hashes[i]); j++ {
 				tr.Update(res.hashes[i][j][:], res.slots[i][j])
 			}
@@ -2285,25 +2099,18 @@ func (s *Syncer) processStorageResponse(res *storageResponse) {
 	// Large contracts could have generated new trie nodes, flush them to disk
 	if res.subTask != nil {
 		if res.subTask.done {
-			root := res.subTask.genTrie.Commit()
-			if err := res.subTask.genBatch.Write(); err != nil {
-				log.Error("Failed to persist stack slots", "err", err)
-			}
-			res.subTask.genBatch.Reset()
-
-			// If the chunk's root is an overflown but full delivery,
-			// clear the heal request.
-			accountHash := res.accounts[len(res.accounts)-1]
-			if root == res.subTask.root && rawdb.HasTrieNode(s.db, accountHash, nil, root, s.scheme) {
+			if root, err := res.subTask.genTrie.Commit(); err != nil {
+				log.Error("Failed to commit stack slots", "err", err)
+			} else if root == res.subTask.root {
+				// If the chunk's root is an overflown but full delivery, clear the heal request
 				for i, account := range res.mainTask.res.hashes {
-					if account == accountHash {
+					if account == res.accounts[len(res.accounts)-1] {
 						res.mainTask.needHeal[i] = false
-						skipStorageHealingGauge.Inc(1)
 					}
 				}
 			}
 		}
-		if res.subTask.genBatch.ValueSize() > ethdb.IdealBatchSize {
+		if res.subTask.genBatch.ValueSize() > ethdb.IdealBatchSize || res.subTask.done {
 			if err := res.subTask.genBatch.Write(); err != nil {
 				log.Error("Failed to persist stack slots", "err", err)
 			}
@@ -2502,24 +2309,17 @@ func (s *Syncer) forwardAccountTask(task *accountTask) {
 			return
 		}
 		task.Next = incHash(hash)
-
-		// Remove the completion flag once the account range is pushed
-		// forward. The leftover accounts will be skipped in the next
-		// cycle.
-		delete(task.stateCompleted, hash)
 	}
 	// All accounts marked as complete, track if the entire task is done
 	task.done = !res.cont
 
-	// Error out if there is any leftover completion flag.
-	if task.done && len(task.stateCompleted) != 0 {
-		panic(fmt.Errorf("storage completion flags should be emptied, %d left", len(task.stateCompleted)))
-	}
 	// Stack trie could have generated trie nodes, push them to disk (we need to
 	// flush after finalizing task.done. It's fine even if we crash and lose this
 	// write as it will only cause more data to be downloaded during heal.
 	if task.done {
-		task.genTrie.Commit()
+		if _, err := task.genTrie.Commit(); err != nil {
+			log.Error("Failed to commit stack account", "err", err)
+		}
 	}
 	if task.genBatch.ValueSize() > ethdb.IdealBatchSize || task.done {
 		if err := task.genBatch.Write(); err != nil {
@@ -2601,7 +2401,13 @@ func (s *Syncer) OnAccounts(peer SyncPeer, id uint64, hashes []common.Hash, acco
 	for i, node := range proof {
 		nodes[i] = node
 	}
-	cont, err := trie.VerifyRangeProof(root, req.origin[:], keys, accounts, nodes.Set())
+	proofdb := nodes.Set()
+
+	var end []byte
+	if len(keys) > 0 {
+		end = keys[len(keys)-1]
+	}
+	cont, err := trie.VerifyRangeProof(root, req.origin[:], end, keys, accounts, proofdb)
 	if err != nil {
 		logger.Warn("Account range failed proof", "err", err)
 		// Signal this request as failed, and ready for rescheduling
@@ -2818,7 +2624,7 @@ func (s *Syncer) OnStorage(peer SyncPeer, id uint64, hashes [][]common.Hash, slo
 	// the requested data. For storage range queries that means the state being
 	// retrieved was either already pruned remotely, or the peer is not yet
 	// synced to our head.
-	if len(hashes) == 0 && len(proof) == 0 {
+	if len(hashes) == 0 {
 		logger.Debug("Peer rejected storage request")
 		s.statelessPeers[peer.ID()] = struct{}{}
 		s.lock.Unlock()
@@ -2830,13 +2636,6 @@ func (s *Syncer) OnStorage(peer SyncPeer, id uint64, hashes [][]common.Hash, slo
 	// Reconstruct the partial tries from the response and verify them
 	var cont bool
 
-	// If a proof was attached while the response is empty, it indicates that the
-	// requested range specified with 'origin' is empty. Construct an empty state
-	// response locally to finalize the range.
-	if len(hashes) == 0 && len(proof) > 0 {
-		hashes = append(hashes, []common.Hash{})
-		slots = append(slots, [][]byte{})
-	}
 	for i := 0; i < len(hashes); i++ {
 		// Convert the keys and proofs into an internal format
 		keys := make([][]byte, len(hashes[i]))
@@ -2853,7 +2652,7 @@ func (s *Syncer) OnStorage(peer SyncPeer, id uint64, hashes [][]common.Hash, slo
 		if len(nodes) == 0 {
 			// No proof has been attached, the response must cover the entire key
 			// space and hash to the origin root.
-			_, err = trie.VerifyRangeProof(req.roots[i], nil, keys, slots[i], nil)
+			_, err = trie.VerifyRangeProof(req.roots[i], nil, nil, keys, slots[i], nil)
 			if err != nil {
 				s.scheduleRevertStorageRequest(req) // reschedule request
 				logger.Warn("Storage slots failed proof", "err", err)
@@ -2864,7 +2663,11 @@ func (s *Syncer) OnStorage(peer SyncPeer, id uint64, hashes [][]common.Hash, slo
 			// returned data is indeed part of the storage trie
 			proofdb := nodes.Set()
 
-			cont, err = trie.VerifyRangeProof(req.roots[i], req.origin[:], keys, slots[i], proofdb)
+			var end []byte
+			if len(keys) > 0 {
+				end = keys[len(keys)-1]
+			}
+			cont, err = trie.VerifyRangeProof(req.roots[i], req.origin[:], end, keys, slots[i], proofdb)
 			if err != nil {
 				s.scheduleRevertStorageRequest(req) // reschedule request
 				logger.Warn("Storage range failed proof", "err", err)

@@ -33,19 +33,19 @@ import (
 
 // BuildPayloadArgs contains the provided parameters for building payload.
 // Check engine-api specification for more details.
-// https://github.com/ethereum/execution-apis/blob/main/src/engine/cancun.md#payloadattributesv3
+// https://github.com/ethereum/execution-apis/blob/main/src/engine/specification.md#payloadattributesv1
 type BuildPayloadArgs struct {
-	Parent       common.Hash           // The parent block to build payload on top
-	Timestamp    uint64                // The provided timestamp of generated payload
-	FeeRecipient common.Address        // The provided recipient address for collecting transaction fee
-	Random       common.Hash           // The provided randomness value
-	Withdrawals  types.Withdrawals     // The provided withdrawals
-	BeaconRoot   *common.Hash          // The provided beaconRoot (Cancun)
-	Version      engine.PayloadVersion // Versioning byte for payload id calculation.
+	Parent       common.Hash       // The parent block to build payload on top
+	Timestamp    uint64            // The provided timestamp of generated payload
+	FeeRecipient common.Address    // The provided recipient address for collecting transaction fee
+	Random       common.Hash       // The provided randomness value
+	Withdrawals  types.Withdrawals // The provided withdrawals
+	BeaconRoot   *common.Hash      // The provided beaconRoot (Cancun)
 }
 
 // Id computes an 8-byte identifier by hashing the components of the payload arguments.
 func (args *BuildPayloadArgs) Id() engine.PayloadID {
+	// Hash
 	hasher := sha256.New()
 	hasher.Write(args.Parent[:])
 	binary.Write(hasher, binary.BigEndian, args.Timestamp)
@@ -57,7 +57,6 @@ func (args *BuildPayloadArgs) Id() engine.PayloadID {
 	}
 	var out engine.PayloadID
 	copy(out[:], hasher.Sum(nil)[:8])
-	out[0] = byte(args.Version)
 	return out
 }
 
@@ -176,7 +175,7 @@ func (payload *Payload) ResolveFull() *engine.ExecutionPayloadEnvelope {
 }
 
 // buildPayload builds the payload according to the provided parameters.
-func (miner *Miner) buildPayload(args *BuildPayloadArgs) (*Payload, error) {
+func (w *worker) buildPayload(args *BuildPayloadArgs) (*Payload, error) {
 	// Build the initial version with no transaction included. It should be fast
 	// enough to run. The empty payload can at least make sure there is something
 	// to deliver for not missing slot.
@@ -190,7 +189,7 @@ func (miner *Miner) buildPayload(args *BuildPayloadArgs) (*Payload, error) {
 		beaconRoot:  args.BeaconRoot,
 		noTxs:       true,
 	}
-	empty := miner.generateWork(emptyParams)
+	empty := w.getSealingBlock(emptyParams)
 	if empty.err != nil {
 		return nil, empty.err
 	}
@@ -226,13 +225,11 @@ func (miner *Miner) buildPayload(args *BuildPayloadArgs) (*Payload, error) {
 			select {
 			case <-timer.C:
 				start := time.Now()
-				r := miner.generateWork(fullParams)
+				r := w.getSealingBlock(fullParams)
 				if r.err == nil {
 					payload.update(r, time.Since(start))
-				} else {
-					log.Info("Error while generating work", "id", payload.id, "err", r.err)
 				}
-				timer.Reset(miner.config.Recommit)
+				timer.Reset(w.recommit)
 			case <-payload.stop:
 				log.Info("Stopping work on payload", "id", payload.id, "reason", "delivery")
 				return

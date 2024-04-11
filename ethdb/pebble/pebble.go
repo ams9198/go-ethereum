@@ -14,6 +14,8 @@
 // You should have received a copy of the GNU Lesser General Public License
 // along with the go-ethereum library. If not, see <http://www.gnu.org/licenses/>.
 
+//go:build (arm64 || amd64) && !openbsd
+
 // Package pebble implements the key-value database layer based on pebble.
 package pebble
 
@@ -25,6 +27,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/pebble"
 	"github.com/cockroachdb/pebble/bloom"
 	"github.com/ethereum/go-ethereum/common"
@@ -126,11 +129,8 @@ type panicLogger struct{}
 func (l panicLogger) Infof(format string, args ...interface{}) {
 }
 
-func (l panicLogger) Errorf(format string, args ...interface{}) {
-}
-
 func (l panicLogger) Fatalf(format string, args ...interface{}) {
-	panic(fmt.Errorf("fatal: "+format, args...))
+	panic(errors.Errorf("fatal: "+format, args...))
 }
 
 // New returns a wrapped pebble DB object. The namespace is the prefix that the
@@ -148,29 +148,15 @@ func New(file string, cache int, handles int, namespace string, readonly bool, e
 
 	// The max memtable size is limited by the uint32 offsets stored in
 	// internal/arenaskl.node, DeferredBatchOp, and flushableBatchEntry.
-	//
-	// - MaxUint32 on 64-bit platforms;
-	// - MaxInt on 32-bit platforms.
-	//
-	// It is used when slices are limited to Uint32 on 64-bit platforms (the
-	// length limit for slices is naturally MaxInt on 32-bit platforms).
-	//
-	// Taken from https://github.com/cockroachdb/pebble/blob/master/internal/constants/constants.go
-	maxMemTableSize := (1<<31)<<(^uint(0)>>63) - 1
+	// Taken from https://github.com/cockroachdb/pebble/blob/master/open.go#L38
+	maxMemTableSize := 4<<30 - 1 // Capped by 4 GB
 
 	// Two memory tables is configured which is identical to leveldb,
 	// including a frozen memory table and another live one.
 	memTableLimit := 2
 	memTableSize := cache * 1024 * 1024 / 2 / memTableLimit
-
-	// The memory table size is currently capped at maxMemTableSize-1 due to a
-	// known bug in the pebble where maxMemTableSize is not recognized as a
-	// valid size.
-	//
-	// TODO use the maxMemTableSize as the maximum table size once the issue
-	// in pebble is fixed.
-	if memTableSize >= maxMemTableSize {
-		memTableSize = maxMemTableSize - 1
+	if memTableSize > maxMemTableSize {
+		memTableSize = maxMemTableSize
 	}
 	db := &Database{
 		fn:           file,
@@ -589,8 +575,8 @@ func (b *batch) Reset() {
 func (b *batch) Replay(w ethdb.KeyValueWriter) error {
 	reader := b.b.Reader()
 	for {
-		kind, k, v, ok, err := reader.Next()
-		if !ok || err != nil {
+		kind, k, v, ok := reader.Next()
+		if !ok {
 			break
 		}
 		// The (k,v) slices might be overwritten if the batch is reset/reused,

@@ -76,6 +76,28 @@
     "withLog": true
   },
   "result": {
+    "beforeEVMTransfers": [
+      {
+        "purpose": "feePayment",
+        "from": "0x4F5777744b500616697CB655DCb02ee6CD51DeB5",
+        "to": null,
+        "value": "0x21c166071e51e6"
+      }
+    ],
+    "afterEVMTransfers": [
+      {
+        "purpose": "gasRefund",
+        "from": null,
+        "to": "0x4F5777744b500616697CB655DCb02ee6CD51DeB5",
+        "value": "0x1026111b8570c0"
+      },
+      {
+        "purpose": "tip",
+        "from": null,
+        "to": "0xf8b483DbA2c3B7176a3Da549ad41A48BB3121069",
+        "value": "0x119b54eb98e126"
+      }
+    ],
     "from": "0x4f5777744b500616697cb655dcb02ee6cd51deb5",
     "gas": "0x33085",
     "gasUsed": "0x1a9e5",
@@ -95,16 +117,14 @@
             "topics": [
               "0xe1c52dc63b719ade82e8bea94cc41a0d5d28e4aaf536adb5e9cccc9ff8c1aeda"
             ],
-            "data": "0x0000000000000000000000004f5777744b500616697cb655dcb02ee6cd51deb5be96016bb57376da7a6d296e0a405ee1501778227dfa604df0a81cb1ae018598",
-            "position": "0x0"
+            "data": "0x0000000000000000000000004f5777744b500616697cb655dcb02ee6cd51deb5be96016bb57376da7a6d296e0a405ee1501778227dfa604df0a81cb1ae018598"
           },
           {
             "address": "0x200edd17f30485a8735878661960cd7a9a95733f",
             "topics": [
               "0xacbdb084c721332ac59f9b8e392196c9eb0e4932862da8eb9beaf0dad4f550da"
             ],
-            "data": "0x0000000000000000000000000000000000000000000000000000000000000000",
-            "position": "0x0"
+            "data": "0x0000000000000000000000000000000000000000000000000000000000000000"
           }
         ],
         "value": "0x8ac7230489e80000",

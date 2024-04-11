@@ -25,7 +25,6 @@ import (
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/math"
-	"github.com/ethereum/go-ethereum/core/tracing"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/crypto/blake2b"
 	"github.com/ethereum/go-ethereum/crypto/bls12381"
@@ -111,15 +110,15 @@ var PrecompiledContractsCancun = map[common.Address]PrecompiledContract{
 // PrecompiledContractsBLS contains the set of pre-compiled Ethereum
 // contracts specified in EIP-2537. These are exported for testing purposes.
 var PrecompiledContractsBLS = map[common.Address]PrecompiledContract{
-	common.BytesToAddress([]byte{11}): &bls12381G1Add{},
-	common.BytesToAddress([]byte{12}): &bls12381G1Mul{},
-	common.BytesToAddress([]byte{13}): &bls12381G1MultiExp{},
-	common.BytesToAddress([]byte{14}): &bls12381G2Add{},
-	common.BytesToAddress([]byte{15}): &bls12381G2Mul{},
-	common.BytesToAddress([]byte{16}): &bls12381G2MultiExp{},
-	common.BytesToAddress([]byte{17}): &bls12381Pairing{},
-	common.BytesToAddress([]byte{18}): &bls12381MapG1{},
-	common.BytesToAddress([]byte{19}): &bls12381MapG2{},
+	common.BytesToAddress([]byte{10}): &bls12381G1Add{},
+	common.BytesToAddress([]byte{11}): &bls12381G1Mul{},
+	common.BytesToAddress([]byte{12}): &bls12381G1MultiExp{},
+	common.BytesToAddress([]byte{13}): &bls12381G2Add{},
+	common.BytesToAddress([]byte{14}): &bls12381G2Mul{},
+	common.BytesToAddress([]byte{15}): &bls12381G2MultiExp{},
+	common.BytesToAddress([]byte{16}): &bls12381Pairing{},
+	common.BytesToAddress([]byte{17}): &bls12381MapG1{},
+	common.BytesToAddress([]byte{18}): &bls12381MapG2{},
 }
 
 var (
@@ -151,6 +150,8 @@ func init() {
 // ActivePrecompiles returns the precompiles enabled with the current configuration.
 func ActivePrecompiles(rules params.Rules) []common.Address {
 	switch {
+	case rules.IsArbitrum:
+		return PrecompiledAddressesArbitrum
 	case rules.IsCancun:
 		return PrecompiledAddressesCancun
 	case rules.IsBerlin:
@@ -164,25 +165,41 @@ func ActivePrecompiles(rules params.Rules) []common.Address {
 	}
 }
 
+type AdvancedPrecompileCall struct {
+	PrecompileAddress common.Address
+	ActingAsAddress   common.Address
+	Caller            common.Address
+	Value             *big.Int
+	ReadOnly          bool
+	Evm               *EVM
+}
+
+type AdvancedPrecompile interface {
+	RunAdvanced(input []byte, suppliedGas uint64, advancedInfo *AdvancedPrecompileCall) (ret []byte, remainingGas uint64, err error)
+	PrecompiledContract
+}
+
 // RunPrecompiledContract runs and evaluates the output of a precompiled contract.
 // It returns
 // - the returned bytes,
 // - the _remaining_ gas,
 // - any error that occurred
-func RunPrecompiledContract(p PrecompiledContract, input []byte, suppliedGas uint64, logger *tracing.Hooks) (ret []byte, remainingGas uint64, err error) {
+func RunPrecompiledContract(p PrecompiledContract, input []byte, suppliedGas uint64, advancedInfo *AdvancedPrecompileCall) (ret []byte, remainingGas uint64, err error) {
+	advanced, isAdvanced := p.(AdvancedPrecompile)
+	if isAdvanced {
+		return advanced.RunAdvanced(input, suppliedGas, advancedInfo)
+	}
+
 	gasCost := p.RequiredGas(input)
 	if suppliedGas < gasCost {
 		return nil, 0, ErrOutOfGas
-	}
-	if logger != nil && logger.OnGasChange != nil {
-		logger.OnGasChange(suppliedGas, suppliedGas-gasCost, tracing.GasChangeCallPrecompiledContract)
 	}
 	suppliedGas -= gasCost
 	output, err := p.Run(input)
 	return output, suppliedGas, err
 }
 
-// ecrecover implemented as a native contract.
+// ECRECOVER implemented as a native contract.
 type ecrecover struct{}
 
 func (c *ecrecover) RequiredGas(input []byte) uint64 {
@@ -271,6 +288,7 @@ type bigModExp struct {
 }
 
 var (
+	big0      = big.NewInt(0)
 	big1      = big.NewInt(1)
 	big3      = big.NewInt(3)
 	big4      = big.NewInt(4)
@@ -457,7 +475,7 @@ func runBn256Add(input []byte) ([]byte, error) {
 	return res.Marshal(), nil
 }
 
-// bn256AddIstanbul implements a native elliptic curve point addition conforming to
+// bn256Add implements a native elliptic curve point addition conforming to
 // Istanbul consensus rules.
 type bn256AddIstanbul struct{}
 

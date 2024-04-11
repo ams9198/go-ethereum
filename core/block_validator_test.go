@@ -50,7 +50,7 @@ func testHeaderVerification(t *testing.T, scheme string) {
 		headers[i] = block.Header()
 	}
 	// Run the header checker for blocks one-by-one, checking for both valid and invalid nonces
-	chain, _ := NewBlockChain(rawdb.NewMemoryDatabase(), DefaultCacheConfigWithScheme(scheme), gspec, nil, ethash.NewFaker(), vm.Config{}, nil, nil)
+	chain, _ := NewBlockChain(rawdb.NewMemoryDatabase(), DefaultCacheConfigWithScheme(scheme), nil, gspec, nil, ethash.NewFaker(), vm.Config{}, nil, nil)
 	defer chain.Stop()
 
 	for i := 0; i < len(blocks); i++ {
@@ -94,6 +94,7 @@ func testHeaderVerificationForMerging(t *testing.T, isClique bool) {
 		preBlocks  []*types.Block
 		postBlocks []*types.Block
 		engine     consensus.Engine
+		merger     = consensus.NewMerger(rawdb.NewMemoryDatabase())
 	)
 	if isClique {
 		var (
@@ -105,7 +106,7 @@ func testHeaderVerificationForMerging(t *testing.T, isClique bool) {
 		gspec = &Genesis{
 			Config:    &config,
 			ExtraData: make([]byte, 32+common.AddressLength+crypto.SignatureLength),
-			Alloc: map[common.Address]types.Account{
+			Alloc: map[common.Address]GenesisAccount{
 				addr: {Balance: big.NewInt(1)},
 			},
 			BaseFee:    big.NewInt(params.InitialBaseFee),
@@ -162,7 +163,7 @@ func testHeaderVerificationForMerging(t *testing.T, isClique bool) {
 		t.Logf("Post-merge header: %d", block.NumberU64())
 	}
 	// Run the header checker for blocks one-by-one, checking for both valid and invalid nonces
-	chain, _ := NewBlockChain(rawdb.NewMemoryDatabase(), nil, gspec, nil, engine, vm.Config{}, nil, nil)
+	chain, _ := NewBlockChain(rawdb.NewMemoryDatabase(), nil, nil, gspec, nil, engine, vm.Config{}, nil, nil)
 	defer chain.Stop()
 
 	// Verify the blocks before the merging
@@ -185,6 +186,11 @@ func testHeaderVerificationForMerging(t *testing.T, isClique bool) {
 		}
 		chain.InsertChain(preBlocks[i : i+1])
 	}
+
+	// Make the transition
+	merger.ReachTTD()
+	merger.FinalizePoS()
+
 	// Verify the blocks after the merging
 	for i := 0; i < len(postBlocks); i++ {
 		_, results := engine.VerifyHeaders(chain, []*types.Header{postHeaders[i]})

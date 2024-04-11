@@ -32,9 +32,9 @@ var (
 	// invocation of a data access operation.
 	errMemorydbClosed = errors.New("database closed")
 
-	// errMemorydbNotFound is returned if a key is requested that is not found in
+	// ErrMemorydbNotFound is returned if a key is requested that is not found in
 	// the provided memory database.
-	errMemorydbNotFound = errors.New("not found")
+	ErrMemorydbNotFound = errors.New("not found")
 
 	// errSnapshotReleased is returned if callers want to retrieve data from a
 	// released snapshot.
@@ -98,7 +98,7 @@ func (db *Database) Get(key []byte) ([]byte, error) {
 	if entry, ok := db.db[string(key)]; ok {
 		return common.CopyBytes(entry), nil
 	}
-	return nil, errMemorydbNotFound
+	return nil, ErrMemorydbNotFound
 }
 
 // Put inserts the given value into the key-value store.
@@ -207,7 +207,7 @@ func (db *Database) Len() int {
 // keyvalue is a key-value tuple tagged with a deletion field to allow creating
 // memory-database write batches.
 type keyvalue struct {
-	key    string
+	key    []byte
 	value  []byte
 	delete bool
 }
@@ -222,14 +222,14 @@ type batch struct {
 
 // Put inserts the given value into the batch for later committing.
 func (b *batch) Put(key, value []byte) error {
-	b.writes = append(b.writes, keyvalue{string(key), common.CopyBytes(value), false})
+	b.writes = append(b.writes, keyvalue{common.CopyBytes(key), common.CopyBytes(value), false})
 	b.size += len(key) + len(value)
 	return nil
 }
 
 // Delete inserts the a key removal into the batch for later committing.
 func (b *batch) Delete(key []byte) error {
-	b.writes = append(b.writes, keyvalue{string(key), nil, true})
+	b.writes = append(b.writes, keyvalue{common.CopyBytes(key), nil, true})
 	b.size += len(key)
 	return nil
 }
@@ -249,10 +249,10 @@ func (b *batch) Write() error {
 	}
 	for _, keyvalue := range b.writes {
 		if keyvalue.delete {
-			delete(b.db.db, keyvalue.key)
+			delete(b.db.db, string(keyvalue.key))
 			continue
 		}
-		b.db.db[keyvalue.key] = keyvalue.value
+		b.db.db[string(keyvalue.key)] = keyvalue.value
 	}
 	return nil
 }
@@ -267,12 +267,12 @@ func (b *batch) Reset() {
 func (b *batch) Replay(w ethdb.KeyValueWriter) error {
 	for _, keyvalue := range b.writes {
 		if keyvalue.delete {
-			if err := w.Delete([]byte(keyvalue.key)); err != nil {
+			if err := w.Delete(keyvalue.key); err != nil {
 				return err
 			}
 			continue
 		}
-		if err := w.Put([]byte(keyvalue.key), keyvalue.value); err != nil {
+		if err := w.Put(keyvalue.key, keyvalue.value); err != nil {
 			return err
 		}
 	}
@@ -377,7 +377,7 @@ func (snap *snapshot) Get(key []byte) ([]byte, error) {
 	if entry, ok := snap.db[string(key)]; ok {
 		return common.CopyBytes(entry), nil
 	}
-	return nil, errMemorydbNotFound
+	return nil, ErrMemorydbNotFound
 }
 
 // Release releases associated resources. Release should always succeed and can

@@ -17,7 +17,6 @@
 package tests
 
 import (
-	"math/rand"
 	"testing"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -57,54 +56,33 @@ func TestBlockchain(t *testing.T) {
 	// which run natively, so there's no reason to run them here.
 }
 
-// TestExecutionSpecBlocktests runs the test fixtures from execution-spec-tests.
-func TestExecutionSpecBlocktests(t *testing.T) {
-	if !common.FileExist(executionSpecBlockchainTestDir) {
-		t.Skipf("directory %s does not exist", executionSpecBlockchainTestDir)
+// TestExecutionSpec runs the test fixtures from execution-spec-tests.
+func TestExecutionSpec(t *testing.T) {
+	if !common.FileExist(executionSpecDir) {
+		t.Skipf("directory %s does not exist", executionSpecDir)
 	}
 	bt := new(testMatcher)
 
-	// These tests fail as of https://github.com/ethereum/go-ethereum/pull/28666, since we
-	// no longer delete "leftover storage" when deploying a contract.
-	bt.skipLoad(`^cancun/eip6780_selfdestruct/selfdestruct/self_destructing_initcode_create_tx.json`)
-	bt.skipLoad(`^cancun/eip6780_selfdestruct/selfdestruct/self_destructing_initcode.json`)
-	bt.skipLoad(`^cancun/eip6780_selfdestruct/selfdestruct/recreate_self_destructed_contract_different_txs.json`)
-	bt.skipLoad(`^cancun/eip6780_selfdestruct/selfdestruct/delegatecall_from_new_contract_to_pre_existing_contract.json`)
-	bt.skipLoad(`^cancun/eip6780_selfdestruct/selfdestruct/create_selfdestruct_same_tx.json`)
+	// cancun tests are not complete yet
+	bt.skipLoad(`^cancun/`)
+	bt.skipLoad(`-fork=Cancun`)
 
-	bt.walk(t, executionSpecBlockchainTestDir, func(t *testing.T, name string, test *BlockTest) {
+	bt.walk(t, executionSpecDir, func(t *testing.T, name string, test *BlockTest) {
 		execBlockTest(t, bt, test)
 	})
 }
 
 func execBlockTest(t *testing.T, bt *testMatcher, test *BlockTest) {
-	// If -short flag is used, we don't execute all four permutations, only one.
-	executionMask := 0xf
-	if testing.Short() {
-		executionMask = (1 << (rand.Int63() & 4))
+	if err := bt.checkFailure(t, test.Run(false, rawdb.HashScheme, nil)); err != nil {
+		t.Errorf("test in hash mode without snapshotter failed: %v", err)
 	}
-	if executionMask&0x1 != 0 {
-		if err := bt.checkFailure(t, test.Run(false, rawdb.HashScheme, nil, nil)); err != nil {
-			t.Errorf("test in hash mode without snapshotter failed: %v", err)
-			return
-		}
+	if err := bt.checkFailure(t, test.Run(true, rawdb.HashScheme, nil)); err != nil {
+		t.Errorf("test in hash mode with snapshotter failed: %v", err)
 	}
-	if executionMask&0x2 != 0 {
-		if err := bt.checkFailure(t, test.Run(true, rawdb.HashScheme, nil, nil)); err != nil {
-			t.Errorf("test in hash mode with snapshotter failed: %v", err)
-			return
-		}
+	if err := bt.checkFailure(t, test.Run(false, rawdb.PathScheme, nil)); err != nil {
+		t.Errorf("test in path mode without snapshotter failed: %v", err)
 	}
-	if executionMask&0x4 != 0 {
-		if err := bt.checkFailure(t, test.Run(false, rawdb.PathScheme, nil, nil)); err != nil {
-			t.Errorf("test in path mode without snapshotter failed: %v", err)
-			return
-		}
-	}
-	if executionMask&0x8 != 0 {
-		if err := bt.checkFailure(t, test.Run(true, rawdb.PathScheme, nil, nil)); err != nil {
-			t.Errorf("test in path mode with snapshotter failed: %v", err)
-			return
-		}
+	if err := bt.checkFailure(t, test.Run(true, rawdb.PathScheme, nil)); err != nil {
+		t.Errorf("test in path mode with snapshotter failed: %v", err)
 	}
 }

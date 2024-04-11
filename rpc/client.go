@@ -61,6 +61,13 @@ const (
 	maxClientSubscriptionBuffer = 20000
 )
 
+type ClientInterface interface {
+	CallContext(ctx_in context.Context, result interface{}, method string, args ...interface{}) error
+	EthSubscribe(ctx context.Context, channel interface{}, args ...interface{}) (*ClientSubscription, error)
+	BatchCallContext(ctx context.Context, b []BatchElem) error
+	Close()
+}
+
 // BatchElem is an element in a batch request.
 type BatchElem struct {
 	Method string
@@ -70,7 +77,7 @@ type BatchElem struct {
 	// discarded.
 	Result interface{}
 	// Error is set if the server returns an error for this request, or if
-	// unmarshalling into Result fails. It is not set for I/O errors.
+	// unmarshaling into Result fails. It is not set for I/O errors.
 	Error error
 }
 
@@ -371,7 +378,8 @@ func (c *Client) CallContext(ctx context.Context, result interface{}, method str
 		if result == nil {
 			return nil
 		}
-		return json.Unmarshal(resp.Result, result)
+		err := json.Unmarshal(resp.Result, result)
+		return err
 	}
 }
 

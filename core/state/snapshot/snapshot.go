@@ -30,7 +30,7 @@ import (
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/metrics"
 	"github.com/ethereum/go-ethereum/rlp"
-	"github.com/ethereum/go-ethereum/triedb"
+	"github.com/ethereum/go-ethereum/trie"
 )
 
 var (
@@ -168,7 +168,7 @@ type Config struct {
 type Tree struct {
 	config Config                   // Snapshots configurations
 	diskdb ethdb.KeyValueStore      // Persistent database to store the snapshot
-	triedb *triedb.Database         // In-memory cache to access the trie through
+	triedb *trie.Database           // In-memory cache to access the trie through
 	layers map[common.Hash]snapshot // Collection of all known layers
 	lock   sync.RWMutex
 
@@ -192,7 +192,7 @@ type Tree struct {
 //     state trie.
 //   - otherwise, the entire snapshot is considered invalid and will be recreated on
 //     a background thread.
-func New(config Config, diskdb ethdb.KeyValueStore, triedb *triedb.Database, root common.Hash) (*Tree, error) {
+func New(config Config, diskdb ethdb.KeyValueStore, triedb *trie.Database, root common.Hash) (*Tree, error) {
 	// Create a new, empty snapshot tree
 	snap := &Tree{
 		config: config,
@@ -258,14 +258,6 @@ func (t *Tree) Disable() {
 	for _, layer := range t.layers {
 		switch layer := layer.(type) {
 		case *diskLayer:
-
-			layer.lock.RLock()
-			generating := layer.genMarker != nil
-			layer.lock.RUnlock()
-			if !generating {
-				// Generator is already aborted or finished
-				break
-			}
 			// If the base layer is generating, abort it
 			if layer.genAbort != nil {
 				abort := make(chan *generatorStats)
@@ -390,6 +382,12 @@ func (t *Tree) Cap(root common.Hash, layers int) error {
 	}
 	diff, ok := snap.(*diffLayer)
 	if !ok {
+		if layers == 0 {
+			t.lock.Lock()
+			defer t.lock.Unlock()
+			t.layers = map[common.Hash]snapshot{root: snap.(snapshot)}
+			return nil
+		}
 		return fmt.Errorf("snapshot [%#x] is disk layer", root)
 	}
 	// If the generator is still running, use a more aggressive cap
@@ -662,13 +660,6 @@ func diffToDisk(bottom *diffLayer) *diskLayer {
 		go res.generate(stats)
 	}
 	return res
-}
-
-// Release releases resources
-func (t *Tree) Release() {
-	if dl := t.disklayer(); dl != nil {
-		dl.Release()
-	}
 }
 
 // Journal commits an entire diff hierarchy to disk into a single journal entry.

@@ -343,7 +343,7 @@ func TestReceiptJSON(t *testing.T) {
 		r := Receipt{}
 		err = r.UnmarshalJSON(b)
 		if err != nil {
-			t.Fatal("error unmarshalling receipt from json:", err)
+			t.Fatal("error unmarshaling receipt from json:", err)
 		}
 	}
 }
@@ -360,7 +360,7 @@ func TestEffectiveGasPriceNotRequired(t *testing.T) {
 	r2 := Receipt{}
 	err = r2.UnmarshalJSON(b)
 	if err != nil {
-		t.Fatal("error unmarshalling receipt from json:", err)
+		t.Fatal("error unmarshaling receipt from json:", err)
 	}
 }
 
@@ -505,7 +505,7 @@ func clearComputedFieldsOnReceipt(receipt *Receipt) *Receipt {
 	cpy.BlockHash = common.Hash{0xff, 0xff, 0x22}
 	cpy.BlockNumber = big.NewInt(math.MaxUint32)
 	cpy.TransactionIndex = math.MaxUint32
-	cpy.ContractAddress = common.Address{0xff, 0xff, 0x33}
+	cpy.ContractAddress = common.Address{} // Arbitrum: we check address is blank before rederiving
 	cpy.GasUsed = 0xffffffff
 	cpy.Logs = clearComputedFieldsOnLogs(receipt.Logs)
 	cpy.EffectiveGasPrice = big.NewInt(0)

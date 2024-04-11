@@ -19,7 +19,6 @@ package node
 import (
 	"compress/gzip"
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -57,7 +56,7 @@ type rpcEndpointConfig struct {
 	jwtSecret              []byte // optional JWT secret
 	batchItemLimit         int
 	batchResponseSizeLimit int
-	httpBodyLimit          int
+	apiFilter              map[string]bool
 }
 
 type rpcHandler struct {
@@ -294,27 +293,36 @@ func (h *httpServer) doStop() {
 	h.server, h.listener = nil, nil
 }
 
+// Arbitrum: Allows injection of custom http.Handler functionality.
+var WrapHTTPHandler = func(srv http.Handler) (http.Handler, error) {
+	return srv, nil
+}
+
 // enableRPC turns on JSON-RPC over HTTP on the server.
 func (h *httpServer) enableRPC(apis []rpc.API, config httpConfig) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
 	if h.rpcAllowed() {
-		return errors.New("JSON-RPC over HTTP is already enabled")
+		return fmt.Errorf("JSON-RPC over HTTP is already enabled")
 	}
 
 	// Create RPC server and handler.
 	srv := rpc.NewServer()
 	srv.SetBatchLimits(config.batchItemLimit, config.batchResponseSizeLimit)
-	if config.httpBodyLimit > 0 {
-		srv.SetHTTPBodyLimit(config.httpBodyLimit)
-	}
+	srv.ApplyAPIFilter(config.apiFilter)
 	if err := RegisterApis(apis, config.Modules, srv); err != nil {
 		return err
 	}
+
+	httpHandler, err := WrapHTTPHandler(srv)
+	if err != nil {
+		return err
+	}
+
 	h.httpConfig = config
 	h.httpHandler.Store(&rpcHandler{
-		Handler: NewHTTPHandlerStack(srv, config.CorsAllowedOrigins, config.Vhosts, config.jwtSecret),
+		Handler: NewHTTPHandlerStack(httpHandler, config.CorsAllowedOrigins, config.Vhosts, config.jwtSecret),
 		server:  srv,
 	})
 	return nil
@@ -336,14 +344,12 @@ func (h *httpServer) enableWS(apis []rpc.API, config wsConfig) error {
 	defer h.mu.Unlock()
 
 	if h.wsAllowed() {
-		return errors.New("JSON-RPC over WebSocket is already enabled")
+		return fmt.Errorf("JSON-RPC over WebSocket is already enabled")
 	}
 	// Create RPC server and handler.
 	srv := rpc.NewServer()
 	srv.SetBatchLimits(config.batchItemLimit, config.batchResponseSizeLimit)
-	if config.httpBodyLimit > 0 {
-		srv.SetHTTPBodyLimit(config.httpBodyLimit)
-	}
+	srv.ApplyAPIFilter(config.apiFilter)
 	if err := RegisterApis(apis, config.Modules, srv); err != nil {
 		return err
 	}
@@ -597,7 +603,7 @@ func newIPCServer(log log.Logger, endpoint string) *ipcServer {
 	return &ipcServer{log: log, endpoint: endpoint}
 }
 
-// start starts the httpServer's http.Server
+// Start starts the httpServer's http.Server
 func (is *ipcServer) start(apis []rpc.API) error {
 	is.mu.Lock()
 	defer is.mu.Unlock()

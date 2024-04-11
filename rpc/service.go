@@ -38,6 +38,8 @@ var (
 type serviceRegistry struct {
 	mu       sync.Mutex
 	services map[string]service
+
+	apiFilter map[string]bool
 }
 
 // service represents a registered object.
@@ -81,11 +83,17 @@ func (r *serviceRegistry) registerName(name string, rcvr interface{}) error {
 		}
 		r.services[name] = svc
 	}
-	for name, cb := range callbacks {
+	for methodName, cb := range callbacks {
+		if r.apiFilter != nil {
+			key := name + "_" + methodName
+			if _, ok := r.apiFilter[key]; !ok {
+				continue
+			}
+		}
 		if cb.isSubscribe {
-			svc.subscriptions[name] = cb
+			svc.subscriptions[methodName] = cb
 		} else {
-			svc.callbacks[name] = cb
+			svc.callbacks[methodName] = cb
 		}
 	}
 	return nil
@@ -93,13 +101,13 @@ func (r *serviceRegistry) registerName(name string, rcvr interface{}) error {
 
 // callback returns the callback corresponding to the given RPC method name.
 func (r *serviceRegistry) callback(method string) *callback {
-	before, after, found := strings.Cut(method, serviceMethodSeparator)
-	if !found {
+	elem := strings.SplitN(method, serviceMethodSeparator, 2)
+	if len(elem) != 2 {
 		return nil
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return r.services[before].callbacks[after]
+	return r.services[elem[0]].callbacks[elem[1]]
 }
 
 // subscription returns a subscription callback in the given service.
@@ -227,7 +235,7 @@ func isSubscriptionType(t reflect.Type) bool {
 	return t == subscriptionType
 }
 
-// isPubSub tests whether the given method's first argument is a context.Context and
+// isPubSub tests whether the given method has as as first argument a context.Context and
 // returns the pair (Subscription, error).
 func isPubSub(methodType reflect.Type) bool {
 	// numIn(0) is the receiver type

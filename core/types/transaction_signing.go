@@ -40,7 +40,8 @@ type sigCache struct {
 func MakeSigner(config *params.ChainConfig, blockNumber *big.Int, blockTime uint64) Signer {
 	var signer Signer
 	switch {
-	case config.IsCancun(blockNumber, blockTime):
+	// we can use 0 here because arbitrum doesn't support Blob transactions.
+	case config.IsCancun(blockNumber, blockTime, 0):
 		signer = NewCancunSigner(config.ChainID)
 	case config.IsLondon(blockNumber):
 		signer = NewLondonSigner(config.ChainID)
@@ -53,6 +54,9 @@ func MakeSigner(config *params.ChainConfig, blockNumber *big.Int, blockTime uint
 	default:
 		signer = FrontierSigner{}
 	}
+	if config.IsArbitrum() {
+		signer = NewArbitrumSigner(signer)
+	}
 	return signer
 }
 
@@ -63,7 +67,7 @@ func MakeSigner(config *params.ChainConfig, blockNumber *big.Int, blockTime uint
 //
 // Use this in transaction-handling code where the current block number is unknown. If you
 // have the current block number available, use MakeSigner instead.
-func LatestSigner(config *params.ChainConfig) Signer {
+func latestSignerImpl(config *params.ChainConfig) Signer {
 	if config.ChainID != nil {
 		if config.CancunTime != nil {
 			return NewCancunSigner(config.ChainID)
@@ -81,6 +85,10 @@ func LatestSigner(config *params.ChainConfig) Signer {
 	return HomesteadSigner{}
 }
 
+func LatestSigner(config *params.ChainConfig) Signer {
+	return NewArbitrumSigner(latestSignerImpl(config))
+}
+
 // LatestSignerForChainID returns the 'most permissive' Signer available. Specifically,
 // this enables support for EIP-155 replay protection and all implemented EIP-2718
 // transaction types if chainID is non-nil.
@@ -88,11 +96,15 @@ func LatestSigner(config *params.ChainConfig) Signer {
 // Use this in transaction-handling code where the current block number and fork
 // configuration are unknown. If you have a ChainConfig, use LatestSigner instead.
 // If you have a ChainConfig and know the current block number, use MakeSigner instead.
-func LatestSignerForChainID(chainID *big.Int) Signer {
+func latestSignerForChainIDImpl(chainID *big.Int) Signer {
 	if chainID == nil {
 		return HomesteadSigner{}
 	}
 	return NewCancunSigner(chainID)
+}
+
+func LatestSignerForChainID(chainID *big.Int) Signer {
+	return NewArbitrumSigner(latestSignerForChainIDImpl(chainID))
 }
 
 // SignTx signs the transaction using the given signer and private key.
@@ -107,7 +119,13 @@ func SignTx(tx *Transaction, s Signer, prv *ecdsa.PrivateKey) (*Transaction, err
 
 // SignNewTx creates a transaction and signs it.
 func SignNewTx(prv *ecdsa.PrivateKey, s Signer, txdata TxData) (*Transaction, error) {
-	return SignTx(NewTx(txdata), s, prv)
+	tx := NewTx(txdata)
+	h := s.Hash(tx)
+	sig, err := crypto.Sign(h[:], prv)
+	if err != nil {
+		return nil, err
+	}
+	return tx.WithSignature(s, sig)
 }
 
 // MustSignNewTx creates a transaction and signs it.
@@ -128,7 +146,8 @@ func MustSignNewTx(prv *ecdsa.PrivateKey, s Signer, txdata TxData) *Transaction 
 // signing method. The cache is invalidated if the cached signer does
 // not match the signer used in the current call.
 func Sender(signer Signer, tx *Transaction) (common.Address, error) {
-	if sigCache := tx.from.Load(); sigCache != nil {
+	if sc := tx.from.Load(); sc != nil {
+		sigCache := sc.(sigCache)
 		// If the signer used to derive from in a previous
 		// call is not the same as used current, invalidate
 		// the cache.
@@ -141,7 +160,7 @@ func Sender(signer Signer, tx *Transaction) (common.Address, error) {
 	if err != nil {
 		return common.Address{}, err
 	}
-	tx.from.Store(&sigCache{signer: signer, from: addr})
+	tx.from.Store(sigCache{signer: signer, from: addr})
 	return addr, nil
 }
 

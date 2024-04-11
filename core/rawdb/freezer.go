@@ -30,7 +30,6 @@ import (
 	"github.com/ethereum/go-ethereum/ethdb"
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/metrics"
-	"github.com/gofrs/flock"
 )
 
 var (
@@ -72,7 +71,7 @@ type Freezer struct {
 
 	readonly     bool
 	tables       map[string]*freezerTable // Data tables for storing everything
-	instanceLock *flock.Flock             // File-system lock to prevent double opens
+	instanceLock FileLock                 // File-system lock to prevent double opens
 	closeOnce    sync.Once
 }
 
@@ -107,7 +106,7 @@ func NewFreezer(datadir string, namespace string, readonly bool, maxTableSize ui
 	}
 	// Leveldb uses LOCK as the filelock filename. To prevent the
 	// name collision, we use FLOCK as the lock name.
-	lock := flock.New(flockFile)
+	lock := NewFileLock(flockFile)
 	tryLock := lock.TryLock
 	if readonly {
 		tryLock = lock.TryRLock

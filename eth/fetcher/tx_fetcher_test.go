@@ -20,7 +20,6 @@ import (
 	"errors"
 	"math/big"
 	"math/rand"
-	"slices"
 	"testing"
 	"time"
 
@@ -187,7 +186,7 @@ func TestTransactionFetcherWaiting(t *testing.T) {
 // waitlist, and none of them are scheduled for retrieval until the wait expires.
 //
 // This test is an extended version of TestTransactionFetcherWaiting. It's mostly
-// to cover the metadata checks without bloating up the basic behavioral tests
+// to cover the metadata checkes without bloating up the basic behavioral tests
 // with all the useless extra fields.
 func TestTransactionFetcherWaitingWithMeta(t *testing.T) {
 	testTransactionFetcherParallel(t, txFetcherTest{
@@ -1031,7 +1030,7 @@ func TestTransactionFetcherRateLimiting(t *testing.T) {
 }
 
 // Tests that if huge transactions are announced, only a small number of them will
-// be requested at a time, to keep the responses below a reasonable level.
+// be requested at a time, to keep the responses below a resonable level.
 func TestTransactionFetcherBandwidthLimiting(t *testing.T) {
 	testTransactionFetcherParallel(t, txFetcherTest{
 		init: func() *TxFetcher {
@@ -1824,12 +1823,12 @@ func testTransactionFetcher(t *testing.T, tt txFetcherTest) {
 					continue
 				}
 				for _, hash := range hashes {
-					if !slices.Contains(request.hashes, hash) {
+					if !containsHash(request.hashes, hash) {
 						t.Errorf("step %d, peer %s: hash %x missing from requests", i, peer, hash)
 					}
 				}
 				for _, hash := range request.hashes {
-					if !slices.Contains(hashes, hash) {
+					if !containsHash(hashes, hash) {
 						t.Errorf("step %d, peer %s: hash %x extra in requests", i, peer, hash)
 					}
 				}
@@ -1851,7 +1850,7 @@ func testTransactionFetcher(t *testing.T, tt txFetcherTest) {
 			for hash := range fetcher.fetching {
 				var found bool
 				for _, req := range fetcher.requests {
-					if slices.Contains(req.hashes, hash) {
+					if containsHash(req.hashes, hash) {
 						found = true
 						break
 					}
@@ -1892,12 +1891,12 @@ func testTransactionFetcher(t *testing.T, tt txFetcherTest) {
 					continue
 				}
 				for _, hash := range hashes {
-					if !slices.Contains(request.hashes, hash) {
+					if !containsHash(request.hashes, hash) {
 						t.Errorf("step %d, peer %s: hash %x missing from requests", i, peer, hash)
 					}
 				}
 				for _, hash := range request.hashes {
-					if !slices.Contains(hashes, hash) {
+					if !containsHash(hashes, hash) {
 						t.Errorf("step %d, peer %s: hash %x extra in requests", i, peer, hash)
 					}
 				}
@@ -1910,7 +1909,7 @@ func testTransactionFetcher(t *testing.T, tt txFetcherTest) {
 				for _, ann := range announces {
 					var found bool
 					for _, hs := range step.fetching {
-						if slices.Contains(hs, ann.hash) {
+						if containsHash(hs, ann.hash) {
 							found = true
 							break
 						}
@@ -1926,7 +1925,7 @@ func testTransactionFetcher(t *testing.T, tt txFetcherTest) {
 				}
 			}
 			for hash := range fetcher.announced {
-				if !slices.Contains(queued, hash) {
+				if !containsHash(queued, hash) {
 					t.Errorf("step %d: hash %x extra in announced", i, hash)
 				}
 			}
@@ -1985,37 +1984,12 @@ func containsHashInAnnounces(slice []announce, hash common.Hash) bool {
 	return false
 }
 
-// Tests that a transaction is forgotten after the timeout.
-func TestTransactionForgotten(t *testing.T) {
-	fetcher := NewTxFetcher(
-		func(common.Hash) bool { return false },
-		func(txs []*types.Transaction) []error {
-			errs := make([]error, len(txs))
-			for i := 0; i < len(errs); i++ {
-				errs[i] = txpool.ErrUnderpriced
-			}
-			return errs
-		},
-		func(string, []common.Hash) error { return nil },
-		func(string) {},
-	)
-	fetcher.Start()
-	defer fetcher.Stop()
-	// Create one TX which is 5 minutes old, and one which is recent
-	tx1 := types.NewTx(&types.LegacyTx{Nonce: 0})
-	tx1.SetTime(time.Now().Add(-maxTxUnderpricedTimeout - 1*time.Second))
-	tx2 := types.NewTx(&types.LegacyTx{Nonce: 1})
-
-	// Enqueue both in the fetcher. They will be immediately tagged as underpriced
-	if err := fetcher.Enqueue("asdf", []*types.Transaction{tx1, tx2}, false); err != nil {
-		t.Fatal(err)
+// containsHash returns whether a hash is contained within a hash slice.
+func containsHash(slice []common.Hash, hash common.Hash) bool {
+	for _, have := range slice {
+		if have == hash {
+			return true
+		}
 	}
-	// isKnownUnderpriced should trigger removal of the first tx (no longer be known underpriced)
-	if fetcher.isKnownUnderpriced(tx1.Hash()) {
-		t.Fatal("transaction should be forgotten by now")
-	}
-	// isKnownUnderpriced should not trigger removal of the second
-	if !fetcher.isKnownUnderpriced(tx2.Hash()) {
-		t.Fatal("transaction should be known underpriced")
-	}
+	return false
 }

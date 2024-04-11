@@ -41,7 +41,6 @@ const (
 	// needs of all CLs.
 	engineAPIBatchItemLimit         = 2000
 	engineAPIBatchResponseSizeLimit = 250 * 1000 * 1000
-	engineAPIBodyLimit              = 128 * 1024 * 1024
 )
 
 var (
@@ -59,6 +58,8 @@ var DefaultConfig = Config{
 	AuthAddr:             DefaultAuthHost,
 	AuthPort:             DefaultAuthPort,
 	AuthVirtualHosts:     DefaultAuthVhosts,
+	AuthModules:          DefaultAuthModules,
+	AuthOrigins:          DefaultAuthOrigins,
 	HTTPModules:          []string{"net", "web3"},
 	HTTPVirtualHosts:     []string{"localhost"},
 	HTTPTimeouts:         rpc.DefaultHTTPTimeouts,

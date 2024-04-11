@@ -25,9 +25,9 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
-	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/ethereum/go-ethereum/accounts"
 	"github.com/ethereum/go-ethereum/common"
@@ -43,6 +43,9 @@ import (
 
 // Node is a container on which services can be registered.
 type Node struct {
+	// Arbitrum: we support stopping the RPC early
+	rpcRunning int32
+
 	eventmux      *event.TypeMux
 	config        *Config
 	accman        *accounts.Manager
@@ -66,6 +69,8 @@ type Node struct {
 	inprocHandler *rpc.Server // In-process RPC request handler to process the API requests
 
 	databases map[*closeTrackingDB]struct{} // All open databases
+
+	apiFilter map[string]bool // Whitelisting API methods
 }
 
 const (
@@ -275,8 +280,20 @@ func (n *Node) openEndpoints() error {
 	if err != nil {
 		n.stopRPC()
 		n.server.Stop()
+	} else {
+		atomic.StoreInt32(&n.rpcRunning, 1)
 	}
 	return err
+}
+
+// containsLifecycle checks if 'lfs' contains 'l'.
+func containsLifecycle(lfs []Lifecycle, l Lifecycle) bool {
+	for _, obj := range lfs {
+		if obj == l {
+			return true
+		}
+	}
+	return false
 }
 
 // stopServices terminates running services, RPC and p2p networking.
@@ -330,9 +347,15 @@ func (n *Node) closeDataDir() {
 	}
 }
 
-// ObtainJWTSecret loads the jwt-secret from the provided config. If the file is not
-// present, it generates a new secret and stores to the given location.
-func ObtainJWTSecret(fileName string) ([]byte, error) {
+// obtainJWTSecret loads the jwt-secret, either from the provided config,
+// or from the default location. If neither of those are present, it generates
+// a new secret and stores to the default location.
+func (n *Node) obtainJWTSecret(cliParam string) ([]byte, error) {
+	fileName := cliParam
+	if len(fileName) == 0 {
+		// no path provided, use default
+		fileName = n.ResolvePath(datadirJWTKey)
+	}
 	// try reading from file
 	if data, err := os.ReadFile(fileName); err == nil {
 		jwtSecret := common.FromHex(strings.TrimSpace(string(data)))
@@ -358,16 +381,9 @@ func ObtainJWTSecret(fileName string) ([]byte, error) {
 	return jwtSecret, nil
 }
 
-// obtainJWTSecret loads the jwt-secret, either from the provided config,
-// or from the default location. If neither of those are present, it generates
-// a new secret and stores to the default location.
-func (n *Node) obtainJWTSecret(cliParam string) ([]byte, error) {
-	fileName := cliParam
-	if len(fileName) == 0 {
-		// no path provided, use default
-		fileName = n.ResolvePath(datadirJWTKey)
-	}
-	return ObtainJWTSecret(fileName)
+// ApplyAPIFilter is the first step in whitelisting given rpc methods inside apiFilter
+func (n *Node) ApplyAPIFilter(apiFilter map[string]bool) {
+	n.apiFilter = apiFilter
 }
 
 // startRPC is a helper method to configure all the various RPC endpoints during node
@@ -404,6 +420,7 @@ func (n *Node) startRPC() error {
 	rpcConfig := rpcEndpointConfig{
 		batchItemLimit:         n.config.BatchRequestLimit,
 		batchResponseSizeLimit: n.config.BatchResponseMaxSize,
+		apiFilter:              n.apiFilter,
 	}
 
 	initHttp := func(server *httpServer, port int) error {
@@ -450,16 +467,14 @@ func (n *Node) startRPC() error {
 			jwtSecret:              secret,
 			batchItemLimit:         engineAPIBatchItemLimit,
 			batchResponseSizeLimit: engineAPIBatchResponseSizeLimit,
-			httpBodyLimit:          engineAPIBodyLimit,
 		}
-		err := server.enableRPC(allAPIs, httpConfig{
+		if err := server.enableRPC(allAPIs, httpConfig{
 			CorsAllowedOrigins: DefaultAuthCors,
 			Vhosts:             n.config.AuthVirtualHosts,
-			Modules:            DefaultAuthModules,
+			Modules:            n.config.AuthModules,
 			prefix:             DefaultAuthPrefix,
 			rpcEndpointConfig:  sharedConfig,
-		})
-		if err != nil {
+		}); err != nil {
 			return err
 		}
 		servers = append(servers, server)
@@ -470,8 +485,8 @@ func (n *Node) startRPC() error {
 			return err
 		}
 		if err := server.enableWS(allAPIs, wsConfig{
-			Modules:           DefaultAuthModules,
-			Origins:           DefaultAuthOrigins,
+			Modules:           n.config.AuthModules,
+			Origins:           n.config.AuthOrigins,
 			prefix:            DefaultAuthPrefix,
 			rpcEndpointConfig: sharedConfig,
 		}); err != nil {
@@ -525,7 +540,17 @@ func (n *Node) wsServerForPort(port int, authenticated bool) *httpServer {
 	return wsServer
 }
 
+// Arbitrum: we support stopping the RPC early.
+// This function can be called multiple times, or before startRPC.
+func (n *Node) StopRPC() {
+	n.stopRPC()
+}
+
 func (n *Node) stopRPC() {
+	if atomic.SwapInt32(&n.rpcRunning, 0) == 0 {
+		// The RPC was already stopped or was never started
+		return
+	}
 	n.http.stop()
 	n.ws.stop()
 	n.httpAuth.stop()
@@ -562,7 +587,7 @@ func (n *Node) RegisterLifecycle(lifecycle Lifecycle) {
 	if n.state != initializingState {
 		panic("can't register lifecycle on running/stopped node")
 	}
-	if slices.Contains(n.lifecycles, lifecycle) {
+	if containsLifecycle(n.lifecycles, lifecycle) {
 		panic(fmt.Sprintf("attempt to register lifecycle %T more than once", lifecycle))
 	}
 	n.lifecycles = append(n.lifecycles, lifecycle)
@@ -699,6 +724,14 @@ func (n *Node) WSAuthEndpoint() string {
 		return "ws://" + n.httpAuth.listenAddr() + n.httpAuth.wsConfig.prefix
 	}
 	return "ws://" + n.wsAuth.listenAddr() + n.wsAuth.wsConfig.prefix
+}
+
+// JWTPath returns the path for JWT secret
+func (n *Node) JWTPath() string {
+	if n.config.JWTSecret == "" {
+		return n.ResolvePath(datadirJWTKey)
+	}
+	return n.config.JWTSecret
 }
 
 // EventMux retrieves the event multiplexer used by all the network services in
